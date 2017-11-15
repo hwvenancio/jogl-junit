@@ -1,0 +1,11 @@
+# Idea stuff
+.idea
+*.iml
+
+# Eclipse stuff
+.project
+.classpath
+.settings/
+
+# Maven stuff
+target/
