@@ -2,25 +2,55 @@ package org.cephalus.jogl.junit;
 
 import com.jogamp.nativewindow.WindowClosingProtocol;
 import com.jogamp.newt.opengl.GLWindow;
-import com.jogamp.opengl.*;
+import com.jogamp.opengl.GLAnimatorControl;
+import com.jogamp.opengl.GLAutoDrawable;
+import com.jogamp.opengl.GLCapabilities;
+import com.jogamp.opengl.GLEventListener;
+import com.jogamp.opengl.GLProfile;
 import com.jogamp.opengl.util.Animator;
 import com.jogamp.opengl.util.FPSAnimator;
-import org.cephalus.jogl.*;
+import org.cephalus.jogl.Compare;
+import org.cephalus.jogl.Configuration;
+import org.cephalus.jogl.Fps;
+import org.cephalus.jogl.Iterations;
+import org.cephalus.jogl.Profile;
+import org.cephalus.jogl.Recorder;
+import org.cephalus.jogl.Swap;
+import org.cephalus.jogl.Window;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Ignore;
+import org.junit.Rule;
 import org.junit.Test;
-import org.junit.internal.runners.statements.RunBefores;
+import org.junit.rules.RunRules;
+import org.junit.rules.TestRule;
 import org.junit.runner.Description;
-import org.junit.runner.Runner;
 import org.junit.runner.notification.Failure;
 import org.junit.runner.notification.RunNotifier;
 import org.junit.runners.ParentRunner;
-import org.junit.runners.model.*;
+import org.junit.runners.model.Annotatable;
+import org.junit.runners.model.FrameworkMethod;
+import org.junit.runners.model.InitializationError;
+import org.junit.runners.model.Statement;
+import org.junit.runners.model.TestClass;
 
-import java.lang.annotation.Annotation;
-import java.lang.reflect.InvocationTargetException;
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.URL;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+
+import static org.cephalus.jogl.ImageComparator.calculateDivergence;
+import static org.cephalus.jogl.ImageComparator.getDifferenceImage;
+import static org.cephalus.jogl.Swap.Type.AUTO;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 public class JoglRunner extends ParentRunner<FrameworkMethod> {
 
@@ -30,16 +60,6 @@ public class JoglRunner extends ParentRunner<FrameworkMethod> {
 
     public JoglRunner(Class<?> klass) throws InitializationError {
         super(klass);
-    }
-
-    @Override
-    public Description getDescription() {
-        Description description = Description.createSuiteDescription(getTestClass().getName());
-        List<FrameworkMethod> testMethods = getTestClass().getAnnotatedMethods(Test.class);
-        for(FrameworkMethod testMethod : testMethods) {
-            description.addChild(Description.createTestDescription(getTestClass().getName(), testMethod.getName()));
-        }
-        return description;
     }
 
     @Override
@@ -53,54 +73,95 @@ public class JoglRunner extends ParentRunner<FrameworkMethod> {
     }
 
     @Override
-    protected void runChild(final FrameworkMethod testMethod, final RunNotifier notifier) {
-        CombinedConfiguration configuration = getConfiguration(testMethod);
+    protected boolean isIgnored(FrameworkMethod testMethod) {
+        return testMethod.getAnnotation(Ignore.class) != null;
+    }
 
+    @Override
+    protected void runChild(final FrameworkMethod testMethod, final RunNotifier notifier) {
         Description testDescription = describeChild(testMethod);
-        try {
-            new Runner(notifier, configuration, getTestClass(), testMethod, testDescription).run();
-        } catch (Throwable e) {
-            notifier.fireTestFailure(new Failure(testDescription, e));
+        if (isIgnored(testMethod)) {
+            notifier.fireTestIgnored(testDescription);
+        } else {
+            try {
+                new Runner(notifier, getTestClass(), testMethod, testDescription).run();
+            } catch (Throwable e) {
+                notifier.fireTestFailure(new Failure(testDescription, e));
+            }
         }
     }
 
-    private CombinedConfiguration getConfiguration(final FrameworkMethod testMethod) {
-        Configuration defaultConfiguration = Runner.class.getAnnotation(Configuration.class);
-        return new CombinedConfiguration(defaultConfiguration, getTestClass(), testMethod);
-    }
-
     @Configuration
-    private static class Runner implements GLEventListener {
+    private static class Runner implements Runnable {
 
         private final RunNotifier notifier;
-        private final CombinedConfiguration config;
         private final TestClass testClass;
         private final FrameworkMethod testMethod;
         private final Description testDescription;
-        private final String title;
 
         private Object testInstance;
 
-        private GLWindow glWindow;
-        private GLAnimatorControl animator;
+        public Runner(RunNotifier notifier,  TestClass testClass, FrameworkMethod testMethod, Description testDescription) {
+            this.notifier = notifier;
+            this.testClass = testClass;
+            this.testMethod = testMethod;
+            this.testDescription = testDescription;
+        }
+
+        @Override
+        public void run() {
+            try {
+                testInstance = testClass.getOnlyConstructor().newInstance();
+
+                Statement test = new LoopRunner(notifier, testClass, testMethod, testDescription, testInstance);
+                test = withRules(test);
+                test.evaluate();
+            } catch (Throwable ex) {
+                notifier.fireTestFailure(new Failure(testDescription, ex));
+            }
+        }
+
+        private Statement withRules(Statement base) {
+            List<TestRule> result = testClass.getAnnotatedFieldValues(testInstance, Rule.class, TestRule.class);
+            return new RunRules(base, result, testDescription);
+        }
+    }
+
+    @Configuration
+    private static class LoopRunner extends Statement implements GLEventListener {
+
+        private final RunNotifier notifier;
+        private final TestClass testClass;
+        private final FrameworkMethod testMethod;
+        private final Description testDescription;
+        private Object testInstance;
+        private final String title;
+        private final List<Class<? extends Throwable>> exceptions;
+
+        private CombinedConfiguration config;
 
         private List<Throwable> errors = new ArrayList<>();
 
         private int iterations = 0;
 
-        public Runner(RunNotifier notifier, CombinedConfiguration config, TestClass testClass, FrameworkMethod testMethod, Description testDescription) throws InitializationError {
+        private GLWindow glWindow;
+        private GLAnimatorControl animator;
+
+        public LoopRunner(RunNotifier notifier, TestClass testClass, FrameworkMethod testMethod, Description testDescription, Object testInstance) {
             this.notifier = notifier;
-            this.config = config;
             this.testClass = testClass;
             this.testMethod = testMethod;
             this.testDescription = testDescription;
+            this.testInstance = testInstance;
             this.title = testDescription.getMethodName();
+            this.exceptions = extractExpectedExceptions(testMethod);
         }
 
-        public void run() throws InterruptedException, IllegalAccessException, InvocationTargetException, InstantiationException {
-            testInstance = testClass.getOnlyConstructor().newInstance();
-
+        @Override
+        public void evaluate() throws Throwable {
             notifier.fireTestStarted(testDescription);
+
+            config = getConfiguration(testMethod);
 
             createWindow();
             createGLEventListener();
@@ -110,6 +171,16 @@ public class JoglRunner extends ParentRunner<FrameworkMethod> {
             animator.getThread().join();
 
             disposeWindow();
+
+            if(!exceptions.isEmpty() && errors.isEmpty()){
+                notifier.fireTestFailure(new Failure(testDescription, new AssertionError("Expected exception: "
+                        + exceptions.get(0).getName())));
+            } else {
+                for (Throwable error : errors) {
+                    if (!expectedException(error))
+                        notifier.fireTestFailure(new Failure(testDescription, error));
+                }
+            }
 
             notifier.fireTestFinished(testDescription);
         }
@@ -123,7 +194,7 @@ public class JoglRunner extends ParentRunner<FrameworkMethod> {
             glWindow.setSize(width, height);
             glWindow.setTitle(title);
             glWindow.setDefaultCloseOperation(WindowClosingProtocol.WindowClosingMode.DO_NOTHING_ON_CLOSE);
-            glWindow.setAutoSwapBufferMode(false);
+            glWindow.setAutoSwapBufferMode(config.swap);
             glWindow.setVisible(true);
         }
 
@@ -174,7 +245,6 @@ public class JoglRunner extends ParentRunner<FrameworkMethod> {
 
         @Override
         public void reshape(GLAutoDrawable drawable, int x, int y, int width, int height) {
-//            System.out.println("reshape");
         }
 
         @Override
@@ -184,6 +254,36 @@ public class JoglRunner extends ParentRunner<FrameworkMethod> {
                 return;
             }
             invoke(testMethod, drawable);
+            compare(drawable);
+        }
+
+        private CombinedConfiguration getConfiguration(final FrameworkMethod testMethod) {
+            Configuration defaultConfiguration = JoglRunner.Runner.class.getAnnotation(Configuration.class);
+            return new CombinedConfiguration(defaultConfiguration, testClass, testMethod);
+        }
+
+        private boolean expectedException(Throwable error) {
+            for(Class<? extends Throwable> errorClass : exceptions)
+                if(errorClass.isInstance(error))
+                    return true;
+            return false;
+        }
+
+        private List<Class<? extends Throwable>> extractExpectedExceptions(FrameworkMethod testMethod) {
+            Test test = testMethod.getAnnotation(Test.class);
+            if(test == null || test.expected() == Test.None.class)
+                return Collections.emptyList();
+            return Collections.singletonList(test.expected());
+        }
+
+        private void compare(GLAutoDrawable drawable) {
+            if(config.compare != null) {
+                try {
+                    config.compare.compareNext(drawable);
+                } catch (Throwable e) {
+                    errors.add(e);
+                }
+            }
         }
     }
 
@@ -193,12 +293,15 @@ public class JoglRunner extends ParentRunner<FrameworkMethod> {
         private int height;
         private int fps;
         private int iterations;
+        private boolean swap;
+        private CombinedCompare compare;
 
-        public CombinedConfiguration(Configuration defaultConfiguration, TestClass testClass, Annotatable testMethod) {
+        public CombinedConfiguration(Configuration defaultConfiguration, TestClass testClass, FrameworkMethod testMethod) {
             apply(defaultConfiguration);
 
             applyAll(testClass);
             applyAll(testMethod);
+            compare = CombinedCompare.create(testClass, testMethod);
         }
 
         private void applyAll(Annotatable source) {
@@ -212,6 +315,8 @@ public class JoglRunner extends ParentRunner<FrameworkMethod> {
             apply(fps);
             Iterations iterations = source.getAnnotation(Iterations.class);
             apply(iterations);
+            Swap swap = source.getAnnotation(Swap.class);
+            apply(swap);
         }
 
         private void apply(Configuration configuration) {
@@ -222,6 +327,7 @@ public class JoglRunner extends ParentRunner<FrameworkMethod> {
             height = configuration.height();
             fps = configuration.fps();
             iterations = configuration.iterations();
+            swap = configuration.swap() == AUTO;
         }
 
         private void apply(Profile annotation) {
@@ -247,6 +353,87 @@ public class JoglRunner extends ParentRunner<FrameworkMethod> {
             if(annotation == null)
                 return;
             iterations = annotation.value();
+        }
+
+        private void apply(Swap annotation) {
+            if(annotation == null)
+                return;
+            swap = annotation.value() == AUTO;
+        }
+    }
+
+    private static class CombinedCompare {
+
+        private final Class<?> javaClass;
+        private final String methodName;
+
+        private String reference;
+        private float maxDivergence;
+
+        private ZipInputStream zip;
+
+        public CombinedCompare(Class<?> javaClass, String methodName) {
+            this.javaClass = javaClass;
+            this.methodName = methodName;
+        }
+
+        public static CombinedCompare create(TestClass testClass, FrameworkMethod testMethod) {
+            Compare methodCompare = testMethod.getAnnotation(Compare.class);
+            Compare classCompare = testClass.getAnnotation(Compare.class);
+
+            if(methodCompare == null && classCompare == null)
+                return null;
+
+            CombinedCompare instance = new CombinedCompare(testClass.getJavaClass(), testMethod.getName());
+            instance.apply(testMethod);
+            instance.apply(classCompare);
+            instance.apply(methodCompare);
+            instance.start();
+            return instance;
+        }
+
+        public void compareNext(GLAutoDrawable drawable) {
+            try {
+                ZipEntry entry = zip.getNextEntry();
+                BufferedImage expected = ImageIO.read(zip);
+                BufferedImage actual = Recorder.takeSnapshot(drawable);
+                BufferedImage diff = getDifferenceImage(expected, actual);
+                float divergence = calculateDivergence(diff);
+                try {
+                    assertTrue(divergence <= maxDivergence);
+                } catch (AssertionError ex) {
+                    save(methodName, entry.getName(), diff);
+                    throw ex;
+                }
+            } catch (IOException ex) {
+                throw new UncheckedIOException(ex);
+            }
+        }
+
+        private void save(String methodName, String frameName, BufferedImage diff) throws IOException {
+            File file = new File("target/recorded-frames/diff_" + methodName + "_" + frameName);
+            file.getParentFile().mkdirs();
+            ImageIO.write(diff, "PNG", file);
+        }
+
+        private void start() {
+            URL resource = javaClass.getResource(reference + ".zip");
+            assertNotNull("Reference not found!", resource);
+            zip = new ZipInputStream(javaClass.getResourceAsStream(reference + ".zip"));
+        }
+
+        private void apply(FrameworkMethod method) {
+            if(reference == null || reference.isEmpty())
+                reference = method.getName();
+        }
+
+        private void apply(Compare compare) {
+            if(compare == null)
+                return;
+
+            if(!compare.reference().isEmpty())
+                this.reference = compare.reference();
+            this.maxDivergence = compare.maxDivergence();
         }
     }
 }
